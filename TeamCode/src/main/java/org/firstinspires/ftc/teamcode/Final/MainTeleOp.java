@@ -19,11 +19,11 @@ public class MainTeleOp extends LinearOpMode {
     static final Rev9AxisImuOrientationOnRobot.I2cPortFacingDirection I2C_PORT_DIRECTION =
             Rev9AxisImuOrientationOnRobot.I2cPortFacingDirection.FORWARD;
 
-    static final double HEADING_KP = 0.02;
+    static final double HEADING_KP = 0.005;
     static final double HEADING_KI = 0.02;
     static final double HEADING_KD = 0.002;
     static final double HEADING_I_ZONE_DEG = 5;
-    static final double HEADING_TOLERANCE_DEG = 2;
+    static final double HEADING_TOLERANCE_DEG = 1;
     static final double HEADING_SETTLED_DEG_PER_SEC = 10;
     static final double MAX_AUTO_TURN_POWER = 0.6;
 
