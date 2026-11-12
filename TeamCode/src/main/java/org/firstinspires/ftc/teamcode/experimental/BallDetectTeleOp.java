@@ -13,8 +13,10 @@ import com.qualcomm.robotcore.util.ElapsedTime;
 import com.qualcomm.robotcore.util.Range;
 
 import org.firstinspires.ftc.robotcore.external.hardware.camera.WebcamName;
+import org.firstinspires.ftc.robotcore.external.hardware.camera.controls.WhiteBalanceControl;
 import org.firstinspires.ftc.robotcore.external.navigation.AngleUnit;
 import org.firstinspires.ftc.teamcode.PIDController;
+import org.firstinspires.ftc.teamcode.WhiteBalanceProcessor;
 import org.firstinspires.ftc.vision.VisionPortal;
 import org.firstinspires.ftc.vision.opencv.Circle;
 import org.firstinspires.ftc.vision.opencv.ColorBlobLocatorProcessor;
@@ -43,6 +45,19 @@ public class BallDetectTeleOp extends LinearOpMode {
     static final double HEADING_SETTLED_DEG_PER_SEC = 10;
     static final double MAX_AUTO_TURN_POWER = 0.6;
 
+    // Heading hold (same as Final/MainTeleOp): when neither the driver nor an automatic mode is turning,
+    // keep the robot pointing the same way (uneven wheel drag would otherwise slowly rotate it while driving).
+    static final boolean HEADING_HOLD_ENABLED = true;
+    static final double HOLD_DEADBAND_DEG = 1;           // errors smaller than this get no angle correction
+    static final double HOLD_KP = 0.02;                  // turn power per degree beyond the deadband (grows smoothly from 0)
+    static final double HOLD_KD = 0.001;                 // turn power per deg/s of rotation, resists any drift right away
+    static final double MAX_HOLD_TURN_POWER = 0.3;
+    static final double HOLD_CAPTURE_DEG_PER_SEC = 20;   // after turning stops, start holding once slower than this
+
+    // SHARE switches ALL stabilization on/off: field-centric (headless) driving + heading hold.
+    // Off = plain robot-centric driving, e.g. if the IMU acts up. The ball modes keep working either way.
+    static final boolean STABILIZATION_ON_AT_START = true;
+
     static final String WEBCAM_NAME = "Webcam 1";
     static final int CAMERA_WIDTH = 320;
     static final int CAMERA_HEIGHT = 240;
@@ -53,6 +68,14 @@ public class BallDetectTeleOp extends LinearOpMode {
     static final double BALL_MAX_AREA = 10000;
     // 1 = perfect circle. Lower this if a real ball is missed (shadows make it less round).
     static final double BALL_MIN_CIRCULARITY = 0.6;
+
+    // White balance, for yellow (or blue) tinted lighting. Two separate fixes, both work in INIT and while driving:
+    // 1) Software color fix (SQUARE = on/off): evens out the picture's average color automatically.
+    static final boolean COLOR_FIX_ON_AT_START = true;
+    // 2) The webcam's own white balance (D-pad), only if the webcam supports it. 0 = the camera decides (auto).
+    //    Find a good value with DPAD UP/DOWN, then write it here so it is used every time.
+    static final int CAMERA_WHITE_BALANCE_K = 0;
+    static final int CAMERA_WHITE_BALANCE_STEP_K = 200;
 
     // Ball aiming (hold CIRCLE). Error = how many pixels the ball is right (+) or left (-) of the picture's center.
     static final double AIM_KP = 0.001;
@@ -80,6 +103,11 @@ public class BallDetectTeleOp extends LinearOpMode {
     static final double MAX_FOLLOW_DRIVE_POWER = 0.3;
     // A close ball looks big, so follow and hit modes allow bigger blobs than BALL_MAX_AREA.
     static final double FOLLOW_MAX_AREA = 76800;
+    // Lost ball in follow mode: keep turning the way the ball left the picture, so a fast-rolling ball isn't lost.
+    static final double FOLLOW_LOST_SECONDS = 1.5;      // give up after this long without seeing the ball
+    static final double FOLLOW_LOST_MAX_TURN_DEG = 120; // ...or after turning this far
+    static final double FOLLOW_LOST_TURN_POWER = 0.15;  // turn power while chasing (faster = blurrier picture)
+    static final double FOLLOW_LOST_EDGE_PX = 40;       // ball vanished closer than this to the center = don't turn, just wait
 
     // Hit mode (green balls only): drive at the closest ball, push straight through it, then stop.
     static final double HIT_APPROACH_POWER = 0.35;     // forward power while steering toward the ball
@@ -110,6 +138,14 @@ public class BallDetectTeleOp extends LinearOpMode {
     int lastAimLoop = -10;
     int lastFollowLoop = -10;
 
+    // White balance (see updateWhiteBalance()).
+    VisionPortal visionPortal;
+    WhiteBalanceProcessor colorFix = new WhiteBalanceProcessor();
+    boolean cameraWbChecked = false;   // asked the webcam whether it has white balance control yet
+    WhiteBalanceControl cameraWb;      // null = the webcam has no white balance control
+    boolean cameraWbManual = false;
+    int cameraWbKelvin = 0;
+
     @Override
     public void runOpMode() {
         DcMotor frontLeft  = hardwareMap.get(DcMotor.class, "mec0");
@@ -132,6 +168,9 @@ public class BallDetectTeleOp extends LinearOpMode {
 
         PIDController headingPid = new PIDController(HEADING_KP, HEADING_KI, HEADING_KD, HEADING_I_ZONE_DEG);
         boolean turningToZero = false;
+        boolean holding = false;     // heading hold is active
+        double holdHeadingDeg = 0;   // the heading heading hold keeps
+        boolean stabilization = STABILIZATION_ON_AT_START;
 
         Mode mode = Mode.NORMAL;
         HitState hitState = HitState.READY;
@@ -142,45 +181,80 @@ public class BallDetectTeleOp extends LinearOpMode {
         double pushHeadingDeg = 0;
         double searchCenterDeg = 0;
         int searchDirection = 1;   // +1 = turning clockwise, -1 = counterclockwise
+        boolean followBallRecent = false;    // follow mode: the ball was seen recently, so chase it if it vanishes
+        double followLastErrorPx = 0;        // where the ball was in the picture when last seen
+        double followLastSeenDeg = 0;        // robot heading when the ball was last seen
+        ElapsedTime followLostTimer = new ElapsedTime();
 
         // One color locator per ball color. Both look at the same camera picture.
         ColorBlobLocatorProcessor purpleLocator = buildBallLocator(PURPLE_BALL_COLOR, Color.rgb(255, 255, 0)); // yellow circles
         ColorBlobLocatorProcessor greenLocator = buildBallLocator(GREEN_BALL_COLOR, Color.rgb(255, 0, 0));      // red circles
 
-        VisionPortal visionPortal = new VisionPortal.Builder()
-                .addProcessors(purpleLocator, greenLocator)
+        colorFix.setEnabled(COLOR_FIX_ON_AT_START);
+        visionPortal = new VisionPortal.Builder()
+                // The color fix must come first: processors run in this order on the same picture.
+                .addProcessors(colorFix, purpleLocator, greenLocator)
                 .setCameraResolution(new Size(CAMERA_WIDTH, CAMERA_HEIGHT))
                 // Our webcam only offers 320x240 in MJPEG, not in the default YUY2 format.
                 .setStreamFormat(VisionPortal.StreamFormat.MJPEG)
                 .setCamera(hardwareMap.get(WebcamName.class, WEBCAM_NAME))
                 .build();
 
-        telemetry.addData("IMU initialized", imuOk);
-        telemetry.addLine("Left stick = drive / strafe, right stick = turn");
-        telemetry.addLine("CROSS (X) = turn back to 0 degrees (normal mode)");
-        telemetry.addLine("OPTIONS = reset heading (point the robot away from you first)");
-        telemetry.addLine("Hold CIRCLE (O) = turn to center the closest ball (normal mode)");
-        telemetry.addLine("HOME (PS) = next mode: NORMAL -> FOLLOW -> HIT (1/2/3 buzzes). FOLLOW and HIT: green balls only");
-        telemetry.addLine("TRIANGLE = search for balls / stop searching (hit mode)");
-        telemetry.addLine("Camera stream: DS menu (3 dots) > Camera Stream, during INIT");
-        telemetry.update();
+        // INIT loop instead of waitForStart(), so the white balance can be adjusted before START.
+        while (opModeInInit()) {
+            updateWhiteBalance();
+            telemetry.addData("IMU initialized", imuOk);
+            telemetry.addLine("Left stick = drive / strafe, right stick = turn");
+            telemetry.addLine("CROSS (X) = turn back to 0 degrees (normal mode)");
+            telemetry.addLine("OPTIONS = reset heading (point the robot away from you first)");
+            telemetry.addLine("Hold CIRCLE (O) = turn to center the closest ball (normal mode)");
+            telemetry.addLine("HOME (PS) = next mode: NORMAL -> FOLLOW -> HIT (1/2/3 buzzes). FOLLOW and HIT: green balls only");
+            telemetry.addLine("TRIANGLE = search for balls / stop searching (hit mode)");
+            telemetry.addLine("SQUARE = color fix on/off, DPAD = camera white balance");
+            telemetry.addLine("SHARE = stabilization (field-centric + heading hold) on/off");
+            telemetry.addLine("Camera stream: DS menu (3 dots) > Camera Stream, during INIT");
+            telemetry.addLine();
+            addWhiteBalanceTelemetry();
+            telemetry.addData("camera", visionPortal.getCameraState());
+            telemetry.update();
+            sleep(20);
+        }
 
-        waitForStart();
+        ElapsedTime loopRateTimer = new ElapsedTime();
+        int loopsSinceRateUpdate = 0;
+        double loopsPerSecond = 0;
 
         while (opModeIsActive()) {
             loopCount++;
+
+            // Loop speed, averaged over half a second so the number is steady enough to read.
+            loopsSinceRateUpdate++;
+            if (loopRateTimer.seconds() >= 0.5) {
+                loopsPerSecond = loopsSinceRateUpdate / loopRateTimer.seconds();
+                loopsSinceRateUpdate = 0;
+                loopRateTimer.reset();
+            }
+
+            if (gamepad1.shareWasPressed()) {
+                stabilization = !stabilization;
+                holding = false;
+                gamepad1.rumble(stabilization ? 300 : 1000);   // short buzz = on, long buzz = off
+            }
 
             if (gamepad1.psWasPressed()) {
                 mode = Mode.values()[(mode.ordinal() + 1) % Mode.values().length];
                 turningToZero = false;
                 hitState = HitState.READY;
                 hitNote = "";
+                followBallRecent = false;
                 gamepad1.rumbleBlips(mode.ordinal() + 1);   // 1 buzz = normal, 2 = follow, 3 = hit
             }
             boolean trianglePressed = gamepad1.triangleWasPressed();   // read once per loop
+            updateWhiteBalance();
 
             if (gamepad1.options) {
                 imu.resetYaw();
+                holding = false;   // the old held heading means nothing after a reset
             }
 
             double heading = imu.getRobotYawPitchRollAngles().getYaw(AngleUnit.RADIANS);
@@ -223,10 +297,14 @@ public class BallDetectTeleOp extends LinearOpMode {
             double y = -gamepad1.left_stick_y;
             double x = gamepad1.left_stick_x;
             double turn = gamepad1.right_stick_x;
-            double driveHeading = heading;   // field-centric while the driver is in control
+            // Field-centric while the driver is in control. Stabilization off = robot-centric.
+            double driveHeading = stabilization ? heading : 0;
+            boolean chasingLostBall = false;
+            boolean autoTurning = false;   // an automatic mode decides the turn power this loop
 
             if (mode == Mode.NORMAL) {
                 // Aim at the closest ball only while CIRCLE is held, a ball is visible, and the driver isn't turning.
+                autoTurning = (target != null && gamepad1.circle && !driverTurning) || turningToZero;
                 if (target != null && gamepad1.circle && !driverTurning) {
                     turn = aimTurn(aimErrorPx);
                 } else if (turningToZero) {
@@ -236,7 +314,30 @@ public class BallDetectTeleOp extends LinearOpMode {
 
             } else if (mode == Mode.FOLLOW) {
                 // Turn toward the closest ball and keep FOLLOW_DISTANCE_CM from it. The driver's sticks win.
-                if (target != null && !driverUsingSticks) {
+                if (driverUsingSticks) {
+                    followBallRecent = false;   // the driver took over, so don't chase an old ball afterwards
+                } else if (target == null && followBallRecent) {
+                    // The ball vanished, e.g. it rolled out of the picture faster than we turned.
+                    double turnedDeg = Math.abs(AngleUnit.normalizeDegrees(headingDeg - followLastSeenDeg));
+                    if (followLostTimer.seconds() > FOLLOW_LOST_SECONDS || turnedDeg > FOLLOW_LOST_MAX_TURN_DEG) {
+                        followBallRecent = false;   // give up and wait for a ball to show up
+                    } else {
+                        chasingLostBall = true;
+                        autoTurning = true;
+                        driveHeading = 0;
+                        x = 0;
+                        y = 0;
+                        // Ball left on the right (+ error) -> clockwise (+ turn). Near the center -> just wait,
+                        // it probably flickered out or rolled under the camera.
+                        turn = Math.abs(followLastErrorPx) < FOLLOW_LOST_EDGE_PX
+                                ? 0 : Math.signum(followLastErrorPx) * FOLLOW_LOST_TURN_POWER;
+                    }
+                } else if (target != null) {
+                    followBallRecent = true;
+                    followLastErrorPx = aimErrorPx;
+                    followLastSeenDeg = headingDeg;
+                    followLostTimer.reset();
+                    autoTurning = true;
                     turn = aimTurn(aimErrorPx);
                     // Drive in the robot's own frame (where the camera looks), not field-centric.
                     driveHeading = 0;
@@ -328,7 +429,29 @@ public class BallDetectTeleOp extends LinearOpMode {
                         }
                         turn = searchDirection * SEARCH_TURN_POWER;
                     }
+
+                    // READY and DONE just stand still, so heading hold may keep the robot pointing the same way.
+                    autoTurning = hitState == HitState.APPROACH || hitState == HitState.PUSH
+                            || hitState == HitState.SEARCH;
                 }
+            }
+
+            // Heading hold: if nobody is turning the robot on purpose, keep it pointing the same way.
+            if (driverTurning || autoTurning || !HEADING_HOLD_ENABLED || !stabilization) {
+                holding = false;
+            } else if (!holding && Math.abs(turnRateDeg) < HOLD_CAPTURE_DEG_PER_SEC) {
+                // The robot has (almost) stopped turning: remember this heading and keep it.
+                holding = true;
+                holdHeadingDeg = headingDeg;
+            }
+            double holdErrorDeg = holding ? AngleUnit.normalizeDegrees(holdHeadingDeg - headingDeg) : 0;
+            if (holding) {
+                // Only the part of the error beyond the deadband counts, so the correction starts at 0 and grows smoothly.
+                double beyondDeadbandDeg = Math.max(0, Math.abs(holdErrorDeg) - HOLD_DEADBAND_DEG);
+                // Positive turn spins the robot clockwise, but heading grows counterclockwise, so flip the sign.
+                // The rotation term works even inside the deadband: turning counterclockwise (+ rate) gets clockwise (+) power.
+                turn = -Math.signum(holdErrorDeg) * HOLD_KP * beyondDeadbandDeg + HOLD_KD * turnRateDeg;
+                turn = Range.clip(turn, -MAX_HOLD_TURN_POWER, MAX_HOLD_TURN_POWER);
             }
 
             double stickAngle = Math.atan2(y, x);
@@ -357,10 +480,18 @@ public class BallDetectTeleOp extends LinearOpMode {
             rearLeft.setPower(rl);
             rearRight.setPower(rr);
 
+            telemetry.addData("loop speed", "%.0f /sec (%.0f ms per loop), camera %.0f pictures/sec",
+                    loopsPerSecond, loopsPerSecond > 0 ? 1000 / loopsPerSecond : 0, visionPortal.getFps());
             telemetry.addData("MODE (HOME to switch)", mode);
+            telemetry.addData("stabilization (SHARE)", stabilization
+                    ? "ON  (field-centric + heading hold)" : "OFF (robot-centric, no heading hold)");
             if (mode == Mode.FOLLOW) {
                 if (driverUsingSticks) {
                     telemetry.addData("follow", "paused, driver using sticks");
+                } else if (chasingLostBall) {
+                    telemetry.addData("follow", turn == 0 ? "ball lost near the center, waiting %.1f s"
+                                    : "ball lost, turning " + (turn > 0 ? "right" : "left") + " to find it (%.1f s)",
+                            followLostTimer.seconds());
                 } else if (target == null) {
                     telemetry.addData("follow", "no ball seen, waiting");
                 } else if (tooCloseToMeasure) {
@@ -404,10 +535,17 @@ public class BallDetectTeleOp extends LinearOpMode {
                             (int) circle.getRadius(), (int) ball.distanceCm()));
                 }
             }
+            addWhiteBalanceTelemetry();
             telemetry.addData("camera", visionPortal.getCameraState());
             telemetry.addLine();
 
             telemetry.addData("auto turn to 0", turningToZero ? "ACTIVE" : "off");
+            if (holding) {
+                telemetry.addData("heading hold", "HOLDING %.1f deg, error %.1f deg", holdHeadingDeg, holdErrorDeg);
+            } else {
+                telemetry.addData("heading hold", !HEADING_HOLD_ENABLED || !stabilization ? "disabled"
+                        : driverTurning || autoTurning ? "off while turning" : "waiting for the robot to stop turning");
+            }
             telemetry.addData("robot heading (deg)", "%.1f", headingDeg);
             telemetry.addData("heading error (deg)", "%.1f", headingErrorDeg);
             telemetry.addData("turn rate (deg/s)", "%.0f", turnRateDeg);
@@ -437,6 +575,85 @@ public class BallDetectTeleOp extends LinearOpMode {
         // Ball right of center (+ error) needs a clockwise turn, which is + turn power, so no sign flip.
         double turn = aimPid.update(aimErrorPx) + Math.signum(aimErrorPx) * AIM_MIN_POWER;
         return Range.clip(turn, -MAX_AIM_TURN_POWER, MAX_AIM_TURN_POWER);
+    }
+
+    // SQUARE = software color fix on/off. DPAD UP/DOWN = set the webcam's white balance by hand, DPAD LEFT = back to auto.
+    void updateWhiteBalance() {
+        // Read every button once per loop, even while the camera isn't ready, so old presses don't pile up.
+        boolean squarePressed = gamepad1.squareWasPressed();
+        boolean upPressed = gamepad1.dpadUpWasPressed();
+        boolean downPressed = gamepad1.dpadDownWasPressed();
+        boolean leftPressed = gamepad1.dpadLeftWasPressed();
+
+        if (squarePressed) {
+            colorFix.setEnabled(!colorFix.isEnabled());
+        }
+
+        // Camera controls only work once the camera is streaming (a second or two after INIT).
+        if (!cameraWbChecked) {
+            if (visionPortal.getCameraState() != VisionPortal.CameraState.STREAMING) {
+                return;
+            }
+            cameraWbChecked = true;
+            WhiteBalanceControl control = visionPortal.getCameraControl(WhiteBalanceControl.class);
+            if (control != null && control.getMaxWhiteBalanceTemperature() > 0) {
+                cameraWb = control;
+                if (CAMERA_WHITE_BALANCE_K > 0) {
+                    setCameraKelvin(CAMERA_WHITE_BALANCE_K);
+                } else {
+                    // The webcam remembers a manual setting from an earlier run, so switch back to auto.
+                    cameraWbManual = !cameraWb.setMode(WhiteBalanceControl.Mode.AUTO);
+                }
+            }
+        }
+        if (cameraWb == null) {
+            return;
+        }
+
+        if (leftPressed) {
+            cameraWbManual = !cameraWb.setMode(WhiteBalanceControl.Mode.AUTO);
+        }
+        if (upPressed || downPressed) {
+            int kelvin = cameraWbKelvin;
+            if (!cameraWbManual) {
+                // Start from what the camera's auto mode picked.
+                kelvin = cameraWb.getWhiteBalanceTemperature();
+                if (kelvin <= 0) {
+                    kelvin = (cameraWb.getMinWhiteBalanceTemperature() + cameraWb.getMaxWhiteBalanceTemperature()) / 2;
+                }
+            }
+            kelvin += upPressed ? CAMERA_WHITE_BALANCE_STEP_K : -CAMERA_WHITE_BALANCE_STEP_K;
+            setCameraKelvin(kelvin);
+        }
+    }
+
+    // Lower kelvin = "the light is yellow", so the camera makes the picture bluer.
+    void setCameraKelvin(int kelvin) {
+        kelvin = Range.clip(kelvin, cameraWb.getMinWhiteBalanceTemperature(), cameraWb.getMaxWhiteBalanceTemperature());
+        cameraWbManual = cameraWb.setMode(WhiteBalanceControl.Mode.MANUAL);
+        if (cameraWbManual && cameraWb.setWhiteBalanceTemperature(kelvin)) {
+            cameraWbKelvin = kelvin;
+        }
+    }
+
+    void addWhiteBalanceTelemetry() {
+        if (colorFix.isEnabled()) {
+            telemetry.addData("color fix (SQUARE)", "ON  red x%.2f  green x%.2f  blue x%.2f",
+                    colorFix.getRedGain(), colorFix.getGreenGain(), colorFix.getBlueGain());
+        } else {
+            telemetry.addData("color fix (SQUARE)", "off");
+        }
+        String camera;
+        if (!cameraWbChecked) {
+            camera = "waiting for the camera";
+        } else if (cameraWb == null) {
+            camera = "not supported by this webcam (use the color fix)";
+        } else if (cameraWbManual) {
+            camera = String.format("MANUAL %d K  (DOWN = less yellow, UP = more yellow, LEFT = auto)", cameraWbKelvin);
+        } else {
+            camera = "AUTO  (DPAD UP/DOWN = set by hand)";
+        }
+        telemetry.addData("camera white balance", camera);
     }
 
     // Forward (+) or backward (-) power that brings the robot to FOLLOW_DISTANCE_CM from the ball.
