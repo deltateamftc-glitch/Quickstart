@@ -52,6 +52,11 @@ Where it lives: **Main** = Main TeleOp (`Final/MainTeleOp.java`, the competition
 - **Circle Button Test** (experimental): Our first hello-world OpMode.
 - **Square Button Test** (experimental) (untested): While you hold SQUARE, telemetry says "Square is pressed". Nothing else.
 
+## Setup and tools
+
+- **Connect robot script** (`connect_robot.cmd`): After joining the robot's Wi-Fi, double-click it (or the "Connect robot" desktop shortcut) so Android Studio finds the Control Hub.
+- **Claude notes** (`CLAUDE.md`): Instructions Claude Code reads automatically: our rules, robot config, and a step-by-step checklist to set the whole project up on a new computer.
+
 ## Installed but not set up yet
 
 - **Pedro Pathing 3.0.1**: Path-following library for autonomous. It needs odometry hardware first (we have none yet).
