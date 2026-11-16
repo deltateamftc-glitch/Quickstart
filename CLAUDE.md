@@ -22,7 +22,8 @@ Claude Code reads this file automatically. It holds what every session needs to 
 
 - Drive (goBILDA Yellow Jackets): `mec0` = Control Hub port 0 = front-left, `mec1` = Expansion Hub port 1 = front-right, `mec2` = Control Hub port 2 = rear-left, `mec3` = Expansion Hub port 3 = rear-right. Left side (mec0, mec2) is REVERSE in software. If the team rewires, re-run `experimental/MotorIdTest` before trusting this.
 - IMU: config name `imu`, type "REV 9-Axis IMU" (external BNO055, I2C 0x29), mounted logo UP / I2C port FORWARD. May change later.
-- Mechanisms (REV UltraPlanetary motors): `m0` = main intake, `m1` = second intake wheel (both REVERSE in Main), `m2` + `m3` = shooter wheels, 1:1, hold 1500 rpm with encoders.
+- Mechanisms (REV UltraPlanetary motors): `m0` = main intake, `m1` = second intake wheel (both REVERSE in Main), `m2` = the one shooter motor (one-shooter design since 2026-11-16; `m3` is gone), 1:1, holds 3000 rpm with its encoder. The user said it is on Control Hub port 2, which is also listed for `mec2` above: check the DS config.
+- Servo: `s0` = Expansion Hub servo port 0, goBILDA Torque servo, DS config type "Servo". CROSS switches it between two positions (0 and 1 for now, to be tuned).
 - Webcam: "Webcam 1", 320×240 MJPEG. This season's game pieces are lime-yellow balls.
 
 ## Versions (do not change by hand)
@@ -32,7 +33,7 @@ Claude Code reads this file automatically. It holds what every session needs to 
 
 ## Tooling
 
-- Repo: https://github.com/deltateamftc-glitch/Quickstart, branch `master`. Commit author for this repo (repo-local, keeps real emails private): `deltateamftc-glitch <deltateamftc-glitch@users.noreply.github.com>`.
+- Repo: https://github.com/deltateamftc-glitch/Quickstart. `master` = robot-verified code; work happens on branches (see "Working on two computers"). Commit author for this repo (repo-local, keeps real emails private): `deltateamftc-glitch <deltateamftc-glitch@users.noreply.github.com>`.
 - Compile check (Git Bash, about 1 minute, exit 0 = OK; ignore the "source value 8 is obsolete" and deprecated-API warnings):
   `JAVA_HOME="/c/Program Files/Android/Android Studio/jbr" ./gradlew --offline -q :TeamCode:compileDebugJavaWithJavac`
   (Leave out `--offline` the first time on a new computer.)
@@ -64,8 +65,20 @@ When the user asks you to set this project up on a new computer, do these steps 
 10. **Test the robot connection (the user does this):** join the robot's Wi-Fi, double-click "Connect robot" on the desktop; it should say `connected to 192.168.43.1:5555` and list the device. Then the Control Hub appears in Android Studio's device dropdown, and Run ▶ deploys the code.
 11. Read `FEATURE_LIST.md` and `FTC_HANDOFF.md`, then tell the user the setup is finished and what they can do next.
 
-## Working on two computers
+## Working on two computers: branches (since 2026-11-16)
 
-- Before starting work: pull (`git pull`, or in Android Studio **Git → Pull**).
-- After finishing: commit and push (after asking), so the other computer can pull it.
-- Never change the same file on both computers without pulling in between.
+The team works in parallel on separate branches and merges finished work into `master`.
+
+- **`master` = the good code**: what has worked on the robot and what we would take to a match. Nobody works directly on `master`.
+- **Every new job gets its own branch**, started from an up-to-date `master`: `feature/<what-it-is>`, e.g. `feature/point-turning`, `feature/servo-arm`. Claude cloud sessions get a `claude/...` branch automatically; treat it like a feature branch.
+- **Commit and push the branch often** (after asking), so the work is on GitHub and the other computer can open it.
+- **Merge into `master`** only once it compiles and works on the robot: open a Pull Request on GitHub (branch → `master`), check the changes, **Merge**. Then everybody switches to `master` and pulls.
+- **Parallel work:** two computers on two different branches never get in each other's way. Git only complains at merge time if both branches changed the same lines (a "merge conflict"); Claude can resolve those.
+- **Keeping a long branch fresh:** if `master` got new merged work, merge `master` into the branch (Android Studio: on the branch, **Git → Merge… → `master`**).
+- The robot runs whatever branch was deployed last. Telemetry or a quick look at **Git → Branches** shows which one is checked out.
+- Before starting work: **Git → Pull** (or `git pull`) on the branch you are on.
+- **Android Studio clicks** (branch menu = branch name in the top-left toolbar, or bottom-right in older versions):
+  - New branch: switch to `master` and pull first, then branch menu → **New Branch…** → name → **Create**.
+  - Open a branch made on another computer: **Git → Fetch**, then branch menu → **Remote Branches** → `origin/<name>` → **Checkout**.
+  - Push: **Git → Push…** (Ctrl+Shift+K) → **Push**.
+  - Commit any unsaved work (or ask Claude) before switching branches.

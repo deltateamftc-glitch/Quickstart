@@ -11,6 +11,7 @@ import com.qualcomm.robotcore.hardware.DcMotor;
 import com.qualcomm.robotcore.hardware.DcMotorEx;
 import com.qualcomm.robotcore.hardware.DcMotorSimple;
 import com.qualcomm.robotcore.hardware.IMU;
+import com.qualcomm.robotcore.hardware.Servo;
 import com.qualcomm.robotcore.util.ElapsedTime;
 import com.qualcomm.robotcore.util.Range;
 
@@ -32,11 +33,14 @@ import java.util.List;
 
 // Competition TeleOp. It only has what the robot needs in a match:
 //   1) Driving: left stick = drive / strafe, right stick = turn. Always field-centric (headless) with heading hold.
+//      TRIANGLE switches the right stick between NORMAL turning (left / right = turn) and POINT turning
+//      (the robot turns to face the way the right stick points, seen from the driver).
 //   2) Ball grab: HOME (PS) = search for yellow balls, lock onto the biggest group, drive at it and push through it,
 //      then search again, over and over. HOME again stops it. A software white balance
 //      (color fix for tinted light) is always on, so yellow light doesn't fool the color detection.
 //   3) Intake / shooting sequence on the D-pad (m0 = main intake, m1 = second intake wheel).
-//   4) Shooter wheels (m2, m3) hold a constant speed from START until the end of the match.
+//   4) Shooter (one motor, m2) holds a constant speed from START until the end of the match.
+//   5) Servo s0: CROSS switches it between two positions.
 // New or untested ideas go to experimental/TestTeleOp first.
 @TeleOp(name = "Main TeleOp", group = "Final")
 public class MainTeleOp extends LinearOpMode {
@@ -56,6 +60,34 @@ public class MainTeleOp extends LinearOpMode {
     static final double MAX_HOLD_TURN_POWER = 0.3;
     static final double HOLD_CAPTURE_DEG_PER_SEC = 20;   // after turning stops, start holding once slower than this
 
+    // Turning modes. TRIANGLE switches between them (short buzz = POINT, long buzz = NORMAL).
+    // NORMAL: right stick left / right = turn right / left.
+    // POINT:  the robot turns until it faces the way the right stick points, seen from the driver:
+    //         stick up = away from you, right = to your right, down = toward you, and every angle in between.
+    //         It doesn't matter which way the robot faces now. When you let go of the stick, the robot finishes
+    //         the turn and keeps facing that way. "Away from you" is the same direction as for the left stick:
+    //         if it is wrong, point the robot away from you and press OPTIONS.
+    static final boolean POINT_TURN_AT_START = false;   // true = the match starts in POINT mode
+    static final double POINT_STICK_MIN = 0.5;          // push the stick at least this far to choose a direction
+                                                        // (near the middle the stick's angle jumps around)
+    // Starting values = our auto-turn to 0 deg in TestTeleOp, which stopped without swinging past.
+    // Turns too slowly: raise POINT_KP a little. Swings past the direction and back: lower POINT_KP or raise POINT_KD.
+    static final double POINT_KP = 0.005;               // turn power per degree still to go
+    static final double POINT_KI = 0.02;                // pushes the last few degrees (only within POINT_I_ZONE_DEG)
+    static final double POINT_KD = 0.002;               // brakes the turn so it doesn't swing past
+    static final double POINT_I_ZONE_DEG = 5;
+    static final double MAX_POINT_TURN_POWER = 0.6;
+    static final double POINT_TOLERANCE_DEG = 1;        // closer than this...
+    static final double POINT_SETTLED_DEG_PER_SEC = 10; // ...and turning slower than this = arrived (heading hold takes over)
+
+    // ---------------------------------------------------------------- servo s0
+    // goBILDA Torque servo on Expansion Hub servo port 0, config name "s0" (type "Servo" in the DS config).
+    // CROSS switches it between these two positions (0 = one end of its travel, 1 = the other end).
+    // It goes to SERVO_POSITION_1 when you press START (servos must not move during INIT).
+    static final String SERVO_NAME = "s0";
+    static final double SERVO_POSITION_1 = 0.0;
+    static final double SERVO_POSITION_2 = 1.0;
+
     // ---------------------------------------------------------------- intake and shooting sequence
     // DPAD DOWN = main intake (m0) spins forward until DPAD DOWN is pressed again (second wheel m1 stays still).
     // DPAD UP   = shooting sequence: m1 spins the whole time, and m0 keeps doing "hiccups" (backwards
@@ -73,8 +105,9 @@ public class MainTeleOp extends LinearOpMode {
     static final double HICCUP_BACK_POWER = 0.7;         // power of the short backwards part of each hiccup
     static final double HICCUP_FORWARD_POWER = 0.7;      // power of the long inward part of each hiccup
 
-    // ---------------------------------------------------------------- shooter wheels (m2, m3)
-    // REV UltraPlanetary motors with encoders. The hub's own velocity controller (PIDF) holds the speed.
+    // ---------------------------------------------------------------- shooter (one motor: m2)
+    // One-shooter design since 2026-11-16 (there used to be two motors, m2 and m3).
+    // REV UltraPlanetary motor with encoder. The hub's own velocity controller (PIDF) holds the speed.
     // true = the shooter wheels just run at full power (1.0) from START, no speed control.
     // false = they hold SHOOTER_RPM with the PID below.
     static final boolean SHOOTER_FULL_POWER = false;
@@ -89,10 +122,9 @@ public class MainTeleOp extends LinearOpMode {
     static final double SHOOTER_P = 100;
     static final double SHOOTER_I = 5;
     static final double SHOOTER_D = 0;
-    // The two wheels usually face each other, so one motor must turn the other way. Flip one if a wheel spins the wrong way.
-    // Both flipped on 2026-11-11 (the team said the shooter ran the wrong way).
+    // If the shooter spins the wrong way, flip this (FORWARD <-> REVERSE). REVERSE was right for the old two-motor
+    // shooter; the new one is built differently, so check it on the first test.
     static final DcMotorSimple.Direction M2_DIRECTION = DcMotorSimple.Direction.REVERSE;
-    static final DcMotorSimple.Direction M3_DIRECTION = DcMotorSimple.Direction.FORWARD;
     // Safety: if a shooter motor reports (almost) no speed this long after START, its encoder cable is probably
     // missing. Then it runs on plain power instead (the speed controller would otherwise go to full power).
     static final double SHOOTER_ENCODER_CHECK_SECONDS = 1.0;
@@ -231,21 +263,24 @@ public class MainTeleOp extends LinearOpMode {
         intake2.setDirection(M1_DIRECTION);
 
         // ---- shooter motors
-        DcMotorEx[] shooters = {hardwareMap.get(DcMotorEx.class, "m2"), hardwareMap.get(DcMotorEx.class, "m3")};
-        String[] shooterNames = {"m2", "m3"};
+        // A list, so a second shooter motor could be added back later with one more entry.
+        DcMotorEx[] shooters = {hardwareMap.get(DcMotorEx.class, "m2")};
+        String[] shooterNames = {"m2"};
         shooters[0].setDirection(M2_DIRECTION);
-        shooters[1].setDirection(M3_DIRECTION);
         double shooterTicksPerRev = MOTOR_ENCODER_TICKS_PER_REV * SHOOTER_GEAR_RATIO;   // per wheel turn
         double shooterTargetTps = SHOOTER_RPM / 60.0 * shooterTicksPerRev;              // ticks per second
         // F = how much "push" a given speed needs by itself, so the controller only has to fix the small difference.
         double shooterF = 32767.0 / (MOTOR_MAX_RPM / 60.0 * MOTOR_ENCODER_TICKS_PER_REV);
-        boolean[] shooterNoEncoder = {false, false};
+        boolean[] shooterNoEncoder = new boolean[shooters.length];   // all false at the start
         for (DcMotorEx shooter : shooters) {
             shooter.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
             shooter.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
             shooter.setVelocityPIDFCoefficients(SHOOTER_P, SHOOTER_I, SHOOTER_D, shooterF);
             shooter.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.FLOAT);
         }
+
+        // ---- servo (it gets no position until START, so it stays still during INIT)
+        Servo servo = hardwareMap.get(Servo.class, SERVO_NAME);
 
         // ---- IMU
         IMU imu = hardwareMap.get(IMU.class, "imu");
@@ -286,6 +321,13 @@ public class MainTeleOp extends LinearOpMode {
         boolean holding = false;     // heading hold is active
         double holdHeadingDeg = 0;   // the heading heading hold keeps
 
+        boolean pointTurnMode = POINT_TURN_AT_START;   // TRIANGLE: false = NORMAL turning, true = POINT turning
+        boolean pointTurning = false;                  // POINT mode is turning the robot to pointTargetDeg right now
+        double pointTargetDeg = 0;                     // the direction the right stick chose
+        PIDController pointPid = new PIDController(POINT_KP, POINT_KI, POINT_KD, POINT_I_ZONE_DEG);
+
+        boolean servoAtPosition2 = false;   // CROSS switches it
+
         IntakeState intakeState = IntakeState.OFF;
         ElapsedTime hiccupTimer = new ElapsedTime();   // time since the shooting sequence began
 
@@ -305,10 +347,13 @@ public class MainTeleOp extends LinearOpMode {
         while (opModeInInit()) {
             telemetry.addData("IMU initialized", imuOk);
             telemetry.addLine("Left stick = drive / strafe, right stick = turn (field-centric + heading hold)");
+            telemetry.addLine("TRIANGLE = turning mode: NORMAL (right stick left / right) or POINT (robot faces where the right stick points)."
+                    + " Starts in " + (POINT_TURN_AT_START ? "POINT" : "NORMAL"));
             telemetry.addLine("OPTIONS = reset heading (point the robot away from you first)");
+            telemetry.addLine("CROSS = servo " + SERVO_NAME + " to the other position (it goes to " + SERVO_POSITION_1 + " at START)");
             telemetry.addLine("HOME (PS) = search for yellow balls, hit them one after another / HOME again = stop. Moving a stick cancels it");
             telemetry.addLine("DPAD DOWN = intake on / off.  DPAD UP = shooting sequence start / end");
-            telemetry.addLine("Shooter wheels m2/m3 start at "
+            telemetry.addLine("Shooter m2 starts at "
                     + (SHOOTER_FULL_POWER ? "FULL POWER" : (int) SHOOTER_RPM + " rpm") + " when you press START");
             telemetry.addLine("Camera stream: DS menu (3 dots) > Camera Stream, during INIT (tap the picture to refresh)");
             telemetry.addLine();
@@ -329,6 +374,7 @@ public class MainTeleOp extends LinearOpMode {
                 shooter.setVelocity(shooterTargetTps);   // the hub keeps this speed from now on
             }
         }
+        servo.setPosition(SERVO_POSITION_1);
 
         while (opModeIsActive()) {
             loopCount++;
@@ -336,10 +382,26 @@ public class MainTeleOp extends LinearOpMode {
             boolean homePressed = gamepad1.psWasPressed();   // HOME / PS button. Read each button once per loop
             boolean downTapped = gamepad1.dpadDownWasPressed();
             boolean upTapped = gamepad1.dpadUpWasPressed();
+            boolean trianglePressed = gamepad1.triangleWasPressed();
+            boolean crossPressed = gamepad1.crossWasPressed();
 
             if (gamepad1.options) {
                 imu.resetYaw();
-                holding = false;   // the old held heading means nothing after a reset
+                holding = false;        // the old held heading means nothing after a reset
+                pointTurning = false;   // ...and neither does an old POINT direction
+            }
+
+            // ------------------------------------------------ turning mode (TRIANGLE)
+            if (trianglePressed) {
+                pointTurnMode = !pointTurnMode;
+                pointTurning = false;
+                gamepad1.rumble(pointTurnMode ? 300 : 1000);   // short buzz = POINT, long buzz = NORMAL
+            }
+
+            // ------------------------------------------------ servo (CROSS)
+            if (crossPressed) {
+                servoAtPosition2 = !servoAtPosition2;
+                servo.setPosition(servoAtPosition2 ? SERVO_POSITION_2 : SERVO_POSITION_1);
             }
 
             double heading = imu.getRobotYawPitchRollAngles().getYaw(AngleUnit.RADIANS);
@@ -386,7 +448,7 @@ public class MainTeleOp extends LinearOpMode {
             intake2.setPower(m1Power);
 
             // ------------------------------------------------ shooter wheels
-            double[] shooterRpm = new double[2];
+            double[] shooterRpm = new double[shooters.length];
             boolean shooterAtSpeed = true;
             for (int i = 0; i < shooters.length; i++) {
                 double tps = shooters[i].getVelocity();
@@ -411,8 +473,13 @@ public class MainTeleOp extends LinearOpMode {
                 seenTimer.reset();   // the ball must be in view without a gap to count as "seen"
             }
 
-            boolean driverTurning = Math.abs(gamepad1.right_stick_x) > 0.1;
-            boolean driverUsingSticks = driverTurning
+            double rightX = gamepad1.right_stick_x;
+            double rightY = -gamepad1.right_stick_y;   // the gamepad says "up" is negative, so flip it: up = +
+            // NORMAL mode: the driver turns with the right stick's left / right.
+            boolean driverTurning = !pointTurnMode && Math.abs(rightX) > 0.1;
+            // POINT mode: the right stick is pushed far enough to choose a direction.
+            boolean driverPointing = pointTurnMode && Math.hypot(rightX, rightY) > POINT_STICK_MIN;
+            boolean driverUsingSticks = driverTurning || driverPointing
                     || Math.hypot(gamepad1.left_stick_x, gamepad1.left_stick_y) > 0.1;
 
             // Aim at the middle of the chosen group; the distance is the one of the nearest ball in it.
@@ -424,7 +491,7 @@ public class MainTeleOp extends LinearOpMode {
 
             double y = -gamepad1.left_stick_y;
             double x = gamepad1.left_stick_x;
-            double turn = gamepad1.right_stick_x;
+            double turn = pointTurnMode ? 0 : rightX;   // POINT mode works out its turn power further down
             double driveHeading = heading;   // field-centric while the driver is in control
             boolean autoTurning = false;     // the ball grab decides the turn power this loop
 
@@ -449,6 +516,8 @@ public class MainTeleOp extends LinearOpMode {
                 x = 0;
                 y = 0;
                 turn = 0;
+                // Forget the old POINT direction, so the robot doesn't swing back to it when the ball grab ends.
+                pointTurning = false;
 
                 if (hitState == HitState.LOST && target != null) {
                     hitState = HitState.APPROACH;   // found it again
@@ -538,9 +607,39 @@ public class MainTeleOp extends LinearOpMode {
                 autoTurning = hitState != HitState.IDLE;
             }
 
+            // ------------------------------------------------ POINT turning (TRIANGLE switches it on / off)
+            // The robot turns to face the way the right stick points. The direction is measured like the drive's:
+            // 0 deg = away from the driver (set by OPTIONS), + = counterclockwise.
+            if (pointTurnMode && !autoTurning) {
+                if (driverPointing) {
+                    // atan2 gives the stick's angle with right = 0 deg and up = 90 deg (counterclockwise).
+                    // Subtract 90 so that up = 0 deg = away from the driver, right = -90, left = +90, down = 180.
+                    pointTargetDeg = AngleUnit.normalizeDegrees(Math.toDegrees(Math.atan2(rightY, rightX)) - 90);
+                    if (!pointTurning) {
+                        pointTurning = true;
+                        pointPid.reset();   // start fresh, no old values from the last turn
+                    }
+                }
+                if (pointTurning) {
+                    // How far the robot still has to turn, the short way round (-180..180 deg, + = counterclockwise).
+                    double pointErrorDeg = AngleUnit.normalizeDegrees(pointTargetDeg - headingDeg);
+                    boolean arrived = Math.abs(pointErrorDeg) < POINT_TOLERANCE_DEG
+                            && Math.abs(turnRateDeg) < POINT_SETTLED_DEG_PER_SEC;
+                    if (!driverPointing && arrived) {
+                        // Stick let go and the robot faces the chosen way: heading hold keeps exactly that direction.
+                        pointTurning = false;
+                        holding = true;
+                        holdHeadingDeg = pointTargetDeg;
+                    } else {
+                        // Positive turn spins the robot clockwise, but the heading grows counterclockwise, so flip the sign.
+                        turn = Range.clip(-pointPid.update(pointErrorDeg), -MAX_POINT_TURN_POWER, MAX_POINT_TURN_POWER);
+                    }
+                }
+            }
+
             // ------------------------------------------------ heading hold
             // If nobody is turning the robot on purpose, keep it pointing the same way.
-            if (driverTurning || autoTurning || !HEADING_HOLD_ENABLED) {
+            if (driverTurning || autoTurning || pointTurning || !HEADING_HOLD_ENABLED) {
                 holding = false;
             } else if (!holding && Math.abs(turnRateDeg) < HOLD_CAPTURE_DEG_PER_SEC) {
                 // The robot has (almost) stopped turning: remember this heading and keep it.
@@ -631,9 +730,18 @@ public class MainTeleOp extends LinearOpMode {
                     colorFix.getRedGain(), colorFix.getGreenGain(), colorFix.getBlueGain(),
                     colorFix.getMeasuredShare() * 100));
             addColorProbeTelemetry(colorProbe);
-            telemetry.addData("heading", holding
-                    ? String.format("%.0f deg, holding %.0f", headingDeg, holdHeadingDeg)
-                    : String.format("%.0f deg", headingDeg));
+            telemetry.addData("turning", pointTurnMode
+                    ? "POINT: the robot faces where the right stick points (TRIANGLE = normal)"
+                    : "NORMAL: right stick left / right (TRIANGLE = point mode)");
+            String headingText = String.format("%.0f deg", headingDeg);
+            if (pointTurning) {
+                headingText += String.format(", turning to %.0f", pointTargetDeg);
+            } else if (holding) {
+                headingText += String.format(", holding %.0f", holdHeadingDeg);
+            }
+            telemetry.addData("heading", headingText);
+            telemetry.addData("servo " + SERVO_NAME, String.format("%.2f (CROSS = switch)",
+                    servoAtPosition2 ? SERVO_POSITION_2 : SERVO_POSITION_1));
             telemetry.update();
         }
 
