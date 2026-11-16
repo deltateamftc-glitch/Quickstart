@@ -45,6 +45,10 @@ import java.util.List;
 @TeleOp(name = "Main TeleOp", group = "Final")
 public class MainTeleOp extends LinearOpMode {
 
+    // Shown at the top of the Driver Station telemetry, so you can see which version is really on the robot.
+    // Change it whenever you change this file (date + a few words about what is new).
+    static final String CODE_VERSION = "UPDATED VERSION 2026-11-16: point turning (TRIANGLE), servo s0 (CROSS), one shooter m2";
+
     // ---------------------------------------------------------------- driving
     static final Rev9AxisImuOrientationOnRobot.LogoFacingDirection LOGO_DIRECTION =
             Rev9AxisImuOrientationOnRobot.LogoFacingDirection.UP;
@@ -345,6 +349,7 @@ public class MainTeleOp extends LinearOpMode {
         // INIT loop instead of a plain waitForStart(), so the camera numbers update live while you look at the stream.
         // Nothing moves here.
         while (opModeInInit()) {
+            telemetry.addLine(CODE_VERSION);
             telemetry.addData("IMU initialized", imuOk);
             telemetry.addLine("Left stick = drive / strafe, right stick = turn (field-centric + heading hold)");
             telemetry.addLine("TRIANGLE = turning mode: NORMAL (right stick left / right) or POINT (robot faces where the right stick points)."
@@ -695,6 +700,7 @@ public class MainTeleOp extends LinearOpMode {
             } else {
                 intakeText = "off (DPAD DOWN = collect, DPAD UP = shoot)";
             }
+            telemetry.addLine(CODE_VERSION);
             telemetry.addData("intake", intakeText);
 
             StringBuilder shooterText = new StringBuilder();
